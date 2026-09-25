@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### 缓存引擎数据目录 ###
+data/
