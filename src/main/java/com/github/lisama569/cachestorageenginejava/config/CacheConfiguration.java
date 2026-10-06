@@ -9,6 +9,7 @@ import java.time.Clock;
 
 /**
  * 引擎 Spring 装配：WAL 在构造期完成打开/恢复，Bean 销毁时 fsync 关闭。
+ * 各业务空间的独立容量通过 cache.namespace-capacities.* 配置。
  */
 @Configuration
 @EnableConfigurationProperties(CacheProperties.class)
@@ -16,7 +17,8 @@ public class CacheConfiguration {
 
     @Bean(destroyMethod = "close")
     public CacheEngine cacheEngine(CacheProperties properties, Clock clock) {
-        CacheEngine engine = new CacheEngine(properties.getMaxEntries(), properties.getDataFile(), clock);
+        CacheEngine engine = new CacheEngine(properties.getMaxEntries(),
+                properties.getNamespaceCapacities(), properties.getDataFile(), clock);
         if (properties.isCompactOnStartup()) {
             engine.compact();
         }

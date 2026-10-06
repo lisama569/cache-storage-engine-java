@@ -1,7 +1,8 @@
 # 本地缓存存储引擎（cache-storage-engine-java）
 
 基于 Spring Boot 的可对外访问本地缓存存储引擎：带 TTL 的键值读写与批量操作、
-容量上限下的确定性淘汰、多线程并发安全、WAL 持久化与崩溃恢复。
+**按空间（namespace）隔离的独立容量**、容量上限下的确定性淘汰、多线程并发安全、
+WAL 持久化与崩溃恢复。
 
 ## 快速开始
 
@@ -10,18 +11,38 @@ mvn spring-boot:run          # 启动服务（默认随机端口，可用 server
 mvn test                     # 运行全部测试
 ```
 
+## 空间模型（namespace）
+
+- 每条数据归属且仅归属一个空间；**不同空间中同名的键是互不影响的两份数据**。
+- **不指定空间时一切行为与引入空间前完全一致**：所有旧式调用落入默认空间
+  `default`，已有数据（含旧版 WAL 文件）也归属默认空间。
+- 每个空间有**各自独立的容量上限与统计计数**，空间之间互不挤占：
+  某空间写满只拒绝该空间自己的新写入，其它空间照常可用。
+- 空间的容量来源（优先级从高到低）：
+  1. 配置 `cache.namespace-capacities.<空间名>=<容量>` 预注册；
+  2. `CacheEngine.registerNamespace(空间名, 容量)` 运行期注册/调整
+     （只约束后续新写入，已有数据不动）；
+  3. 未注册空间首次访问时以 `cache.max-entries` 为容量**懒创建**。
+- **极端情形的确定行为**：空间容量为 0 时，该空间的任何新写入（单写/批量写）
+  都确定性地返回 `CAPACITY_FULL`，读取返回 `NOT_FOUND`——单条数据即超过空间
+  总容量时结果明确、可预期，不会部分生效，也不会丢掉其它空间的数据。
+
 ### REST 接口
+
+所有端点缺省作用于默认空间；指定空间的方式：GET/DELETE/stats/purge-expired
+用查询参数 `?ns=<空间名>`，批量端点在请求体中带 `"namespace"` 字段。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/cache/{key}` | 读取单键 |
-| POST | `/api/cache` | 写入单键，body: `{"key","value","ttlMillis"}` |
-| DELETE | `/api/cache/{key}` | 删除单键 |
-| POST | `/api/cache/batch-get` | 批量读，body: `{"keys":[...]}`，逐键返回命中值或失败原因 |
-| POST | `/api/cache/batch-put` | 原子批量写，body: `{"entries":{...},"ttlMillis"}` |
-| POST | `/api/cache/batch-delete` | 批量删，逐键返回结果状态 |
-| POST | `/api/cache/purge-expired` | 主动清理过期键，返回回收数量 |
-| GET | `/api/cache/stats` | 统计：size/capacity/hits/misses/expirations/evictions |
+| GET | `/api/cache/{key}?ns=` | 读取单键 |
+| POST | `/api/cache` | 写入单键，body: `{"key","value","ttlMillis","namespace"?}` |
+| DELETE | `/api/cache/{key}?ns=` | 删除单键 |
+| POST | `/api/cache/batch-get` | 批量读，body: `{"keys":[...],"namespace"?}`，逐键返回命中值或失败原因 |
+| POST | `/api/cache/batch-put` | 单空间原子批量写，body: `{"entries":{...},"ttlMillis","namespace"?}` |
+| POST | `/api/cache/batch-delete` | 批量删，body: `{"keys":[...],"namespace"?}`，逐键返回结果状态 |
+| POST | `/api/cache/purge-expired?ns=` | 主动清理过期键；不带 `ns` 时清理所有空间，返回回收数量 |
+| GET | `/api/cache/stats?ns=` | 指定空间统计：size/capacity/hits/misses/expirations/evictions；缺省为默认空间 |
+| GET | `/api/cache/namespaces` | 当前已知空间列表 |
 
 失败原因通过 **HTTP 状态码 + 响应体 `code`** 双重区分：
 
@@ -34,40 +55,45 @@ mvn test                     # 运行全部测试
 ## 一致性模型
 
 - **线性化**：每个对外操作（get/put/delete/批量操作）对键空间状态构成一个线性化点。
-  写路径（put/delete/批量写/清理/压缩）在单把引擎级写锁下串行执行；同一键上的
-  更新、过期清理与删除互斥，不存在锁顺序环，**无死锁**。
+  写路径（put/delete/批量写/清理/压缩/注册空间）在**单把引擎级写锁**下串行执行，
+  跨空间同样互斥；不存在多锁顺序环，**无死锁**。
 - **无锁读路径**：读不加锁。写线程用"整体替换条目对象"的方式发布更新
   （`ConcurrentHashMap` 保证安全发布），读者只能看到更新前或更新后的完整对象，
   不会读到撕裂状态；单写者递增序列下读者不会观测到回退。
-- **无丢失更新 / 无计数漂移**：容量占用与 hits/misses/expirations/evictions
-  等计数只在写锁内或以原子变量修改；并发容量边界精确（放满即拒，不多不少）。
+- **无丢失更新 / 无计数漂移**：各空间的容量占用与 hits/misses/expirations/evictions
+  计数只在写锁内或以原子变量修改；并发容量边界精确（放满即拒，不多不少），
+  跨空间并发写入后各空间计数各自精确。
 - **过期回收的并发安全**：读线程惰性回收过期条目时使用 CAS（`map.remove(key, entry)`），
   只有条目仍是同一个过期对象时才删除，绝不误删并发写入的新值。
-- **批量写原子性**：`batch-put` 先校验全部键值、回收过期、核算容量，全部通过才生效；
-  任一条件不满足则**整体拒绝**，已有数据与计数完全不变。
+- **批量写原子性**：`batch-put` 在单个空间内先校验全部键值、回收过期、核算容量，
+  全部通过才生效；任一条件不满足则**整体拒绝**，已有数据与计数完全不变。
 
-## 过期与淘汰规则
+## 过期与淘汰规则（按空间独立判定）
 
 1. **过期判定**：`now >= expireAtMillis`，到期瞬间即过期；`ttlMillis <= 0` 表示永不过期。
 2. **回收时机**（确定性）：
    - 惰性：读命中已过期键时 CAS 回收，返回 `EXPIRED`；
-   - 主动：每次写入前、显式调用 `purge-expired`、容量判定前，先回收全部已过期条目。
+   - 主动：每次写入前、显式调用 `purge-expired`、容量判定前，先回收该空间全部已过期条目。
 3. **容量不足不静默丢数据**：回收过期条目后仍放不下时，写入被拒绝并返回
    `CAPACITY_FULL`——**未过期数据绝不因容量被静默淘汰**。覆盖已有键不占新槽位，
-   容量满时仍可成功。
+   容量满时仍可成功。容量判定只针对目标空间，一个空间写满不影响其它空间写入。
 4. **状态可区分**：已被回收的过期键（物理删除）再访问返回 `NOT_FOUND`；
-   已过期但尚未回收的键返回 `EXPIRED`。两者均可与彼此及 `OK` 明确区分。
+   已过期但尚未回收的键返回 `EXPIRED`；容量不足返回 `CAPACITY_FULL`。
+   三者及 `OK` 均可明确区分。
 
 ## 持久化、恢复与容错边界
 
-### WAL 格式
+### WAL 格式（当前版本 v2）
 
 ```
-文件头: MAGIC(3B 'CLW') + VERSION(1B)
-帧:    type(1B) | keyLen(4B) | valueLen(4B) | expireAtMillis(8B)
-      | CRC32(4B，覆盖前述字段与 key/value 载荷) | key(UTF-8) | value(UTF-8)
+文件头: MAGIC(3B 'CLW') + VERSION(1B = 2)
+帧:    type(1B) | nsLen(4B) | keyLen(4B) | valueLen(4B) | expireAtMillis(8B)
+      | CRC32(4B，覆盖前述字段与 ns/key/value 载荷) | ns(UTF-8) | key(UTF-8) | value(UTF-8)
 ```
 
+- **向后兼容（v1 旧文件）**：引入空间前的 v1 文件（无空间字段）打开时按旧格式恢复，
+  记录归属默认空间；恢复完成后文件**自动整体升级重写为 v2**（逻辑记录不变），
+  此后追加统一使用 v2。已有数据与旧调用方式不受影响。
 - **写顺序**：先追加 WAL 并 `fsync`，再改内存。WAL 写失败则内存不变，调用方收到异常。
 - **删除**：仅对存活条目的显式删除写 DELETE 记录；过期回收不写 WAL
   （重放时过期 PUT 按当时时钟跳过，语义等价）。
@@ -77,31 +103,47 @@ mvn test                     # 运行全部测试
 - 启动时顺序校验每一帧；遇到**帧头不完整、帧体截断、类型/长度非法或 CRC 不匹配**，
   立即停止重放，并将文件**截断到最后一条有效帧之后**——损坏尾部被识别并忽略，
   **不导致启动失败，也不会读出脏数据**；截断后文件可继续正常追加。
-- 重放语义：PUT 覆盖、DELETE 删除、已过期 PUT 跳过；恢复后存活条目数超过容量上限时
-  保留全部已恢复数据（上限只约束新写入），并输出告警日志。
+- 重放语义：PUT 覆盖、DELETE 删除、已过期 PUT 跳过；**每条记录按 WAL 中的空间名
+  归位**，重启后各空间的数据、空间归属与占用情况与重启前一致。
+  某空间恢复后存活条目数超过其容量上限时保留全部已恢复数据
+  （上限只约束新写入），并输出告警日志。
 - **容错边界**：WAL 头（MAGIC/VERSION）损坏时判定为不可识别文件并重建为空日志
   （原数据视为全部丢失，属已声明的边界）；磁盘级故障（fsync 之后数据仍丢失）
   不在本引擎保证范围内。
-- **压缩**：`compact()` 用当前存活快照原子重写 WAL（临时文件 + fsync + 原子替换），
-  丢弃被覆盖/已删除/已过期的历史记录。
+- **压缩**：`compact()` 用全部空间的当前存活快照原子重写 WAL
+  （临时文件 + fsync + 原子替换），丢弃被覆盖/已删除/已过期的历史记录，
+  空间归属随记录一并保留。
 
 ## 配置项
 
 | 配置 | 默认值 | 说明 |
 |---|---|---|
-| `cache.max-entries` | 1024 | 最大存活条目数；满且回收过期后仍放不下时写入返回 `CAPACITY_FULL` |
+| `cache.max-entries` | 1024 | 默认空间及未注册空间的最大存活条目数；满且回收过期后仍放不下时写入返回 `CAPACITY_FULL` |
+| `cache.namespace-capacities.<空间名>` | 无 | 预注册业务空间及其独立容量，如 `cache.namespace-capacities.order=500`；容量 0 表示该空间拒绝一切新写入 |
 | `cache.data-file` | `data/cache.wal` | WAL 数据文件路径（目录自动创建） |
 | `cache.compact-on-startup` | false | 启动恢复完成后是否立即压缩 WAL |
 | `server.port` | 0（随机） | HTTP 服务端口 |
 
 ## 测试
 
-`src/test/.../tests/` 下 33 个用例，日志中打印输入、判定依据与恢复结果：
+`src/test/.../tests/` 下 56 个用例，日志中打印输入、判定依据与恢复结果：
 
 - `ExpiryBoundaryTest`：到期瞬间边界、NOT_FOUND/EXPIRED 区分、过期槽位回收、重启后过期键缺席；
 - `CapacityEvictionTest`：容量满拒绝且不丢存活数据、覆盖不占槽位、批量写原子性、统计一致性；
+- `NamespaceIsolationTest`：跨空间同名键互不影响、默认空间与旧式调用等价、批量/统计/清理按空间生效、
+  空间懒创建与列表；
+- `NamespaceCapacityTest`：空间写满只影响本空间、满空间覆盖仍可写、过期槽位只在本空间回收腾位、
+  容量 0 空间确定性拒绝、超容量批量写整体拒绝、运行期容量调整；
 - `ConcurrencyTest`：同键并发写无丢失更新、并发容量边界精确、读写线性化（无回退）、
   混合操作无死锁、并发写后重启完整恢复；
+- `NamespaceConcurrencyTest`：跨空间并发写计数精确且不漂移、并发下各空间容量边界精确、
+  跨空间混合操作无死锁且终态自洽；
 - `RestartRecoveryTest`：正常重启恢复、删除持久化、撕裂写尾部截断、CRC 损坏帧及之后数据忽略、
   冷启动、压缩后状态保持、多轮重启稳定；
-- `CacheApiTest`：REST 端到端，404/410/507 失败原因可区分，批量操作逐键结果。
+- `NamespaceRecoveryTest`：重启后各空间数据/归属/占用一致、带空间的损坏尾部被忽略且服务可启动、
+  压缩保留空间归属、v1 旧格式 WAL 兼容恢复并自动升级 v2；
+- `CacheApiTest`：REST 端到端，404/410/507 失败原因可区分，批量操作逐键结果；
+- `NamespaceApiTest`：REST 层空间隔离、按空间 507、批量与统计按空间生效、空间列表。
+
+验证方式：`mvn test` 全量运行；测试日志中以 `[输入]`/`[判定]`/`[恢复结果]`
+前缀打印关键依据，可直接核对。
