@@ -23,9 +23,11 @@ class RestartRecoveryTest {
 
     private static final Logger log = LoggerFactory.getLogger(RestartRecoveryTest.class);
 
-    /** 帧固定区长度：type(1)+keyLen(4)+valueLen(4)+expireAt(8)+crc(4)。 */
-    private static final int FRAME_FIXED = 21;
+    /** v2 帧固定区长度：type(1)+nsLen(4)+keyLen(4)+valueLen(4)+expireAt(8)+crc(4)。 */
+    private static final int FRAME_FIXED = 25;
     private static final int HEADER = 4;
+    /** 默认空间名 "default" 的 UTF-8 字节长度。 */
+    private static final int NS_LEN = 7;
 
     @TempDir
     Path dir;
@@ -108,8 +110,8 @@ class RestartRecoveryTest {
             e.put("k2", "v2", 0); // 帧2: offset 4+25=29
             e.put("k3", "v3", 0); // 帧3
         }
-        // 帧2 起始偏移：HEADER + (FRAME_FIXED + keyLen2 + valueLen2)
-        int frame1Len = FRAME_FIXED + 2 + 2;
+        // 帧2 起始偏移：HEADER + (FRAME_FIXED + nsLen + keyLen + valueLen)
+        int frame1Len = FRAME_FIXED + NS_LEN + 2 + 2;
         int frame2Offset = HEADER + frame1Len;
         // 翻转帧2 载荷中的一个字节（key 首字节），造成 CRC 不匹配
         try (RandomAccessFile raf = new RandomAccessFile(wal.toFile(), "rw")) {
